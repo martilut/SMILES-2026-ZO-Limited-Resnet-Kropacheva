@@ -19,6 +19,8 @@ Usage
 
 from __future__ import annotations
 
+import os, random
+import numpy as np
 import argparse
 import json
 import sys
@@ -32,9 +34,28 @@ import torchvision.datasets as datasets
 from augmentation import get_transforms
 from model import get_model, get_model_imagenet_head
 from zo_optimizer import ZeroOrderOptimizer
+from train_data import get_train_dataset_loader
 
 
-_MAX_BUDGET = 1024  # Maximum allowed total samples (n_batches × batch_size)
+_MAX_BUDGET = 8192  # Maximum allowed total samples (n_batches × batch_size)
+
+
+def seed_everything(seed: int = 42) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # For reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # PyTorch deterministic algorithms
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +242,20 @@ def parse_args() -> argparse.Namespace:
         default="results.json",
         help="File path to write the results JSON.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    seed_everything(args.seed)
+    generator_train = torch.Generator()
+    generator_train.manual_seed(args.seed)
 
     # ------------------------------------------------------------------
     # Budget enforcement
@@ -256,11 +286,10 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     print(f"[Data] Loading CIFAR100 from '{args.data_dir}' ...")
 
-    train_dataset = datasets.CIFAR100(
-        root=args.data_dir,
-        train=True,
-        download=True,
-        transform=get_transforms(train=True),
+    train_dataset, train_loader = get_train_dataset_loader(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        generator_train=generator_train,
     )
     val_dataset = datasets.CIFAR100(
         root=args.data_dir,
@@ -268,19 +297,11 @@ if __name__ == "__main__":
         download=True,
         transform=get_transforms(train=False),
     )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-    )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
     )
 
