@@ -21,11 +21,15 @@ Key design points
 
 from __future__ import annotations
 
+import csv
 import math
+import os
 from typing import Callable
 
 import torch
 import torch.nn as nn
+
+from config import OPTIMIZATION_MODE, N_BATCHES, SPSA_K, FREEZE
 
 
 class ZeroOrderOptimizer:
@@ -87,12 +91,88 @@ class ZeroOrderOptimizer:
         # You can also update self.layer_names inside .step() to implement
         # a dynamic schedule (e.g. gradually unfreeze deeper layers).
         # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.modes = self._init_optimization_modes()
+        self.save_mode_param_counts()
+        self.mode = OPTIMIZATION_MODE
+        self.steps = 0
+        if self.mode in ("dynamic", "dynamic_reverse"):
+            self.layer_names: list[str] = self.modes["fc"]
+        else:
+            self.layer_names: list[str] = self.modes[self.mode]
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Internal helpers — students may modify these.
     # ------------------------------------------------------------------
+
+    def _init_optimization_modes(self) -> dict[str, list[str]]:
+        all_params = [n for n, _ in self.model.named_parameters()]
+        fc = [n for n in all_params if n.startswith("fc.")]
+
+        def is_bn(n: str) -> bool:
+            return (
+                    n.startswith("bn1.")
+                    or ".bn1." in n or ".bn2." in n
+                    or ".downsample.1." in n
+            )
+
+        bn_all = [n for n in all_params if is_bn(n)]
+
+        bn_stem = [n for n in bn_all if n.startswith("bn1.")]
+        bn_block = [n for n in bn_all if (".bn1." in n or ".bn2." in n)]
+        bn_down = [n for n in bn_all if ".downsample.1." in n]
+
+        def is_conv(n: str) -> bool:
+            return (
+                    n == "conv1.weight"
+                    or ".conv1.weight" in n or ".conv2.weight" in n
+                    or ".downsample.0.weight" in n
+            )
+
+        conv_all = [n for n in all_params if is_conv(n)]
+
+        last_conv = ["layer4.1.conv2.weight"]
+        layer4_convs = [n for n in conv_all if n.startswith("layer4.")]
+        layer4_1 = [n for n in all_params if n.startswith("layer4.1.")]
+        layer4_0 = [n for n in all_params if n.startswith("layer4.0.")]
+
+        modes = {
+            "fc": fc,
+            "fc_bn_stem": fc + bn_stem,
+            "fc_bn_block": fc + bn_block,
+            "fc_bn_down": fc + bn_down,
+            "fc_bn_all": fc + bn_all,
+            "fc_last_conv": fc + last_conv,
+            "fc_bn_all_last_conv": fc + bn_all + last_conv,
+            "fc_bn_all_layer4": fc + bn_all + layer4_convs,
+            "bn_all": bn_all,
+            "last_conv_only": last_conv,
+            "layer4_1": layer4_1,
+            "layer4_0": layer4_0,
+        }
+        return modes
+
+    def _update_dynamic_schedule(self) -> None:
+        progress = self.steps / N_BATCHES
+        if progress < 1 / 3:
+            self.layer_names = self.modes["fc"]
+        elif progress < 2 / 3:
+            self.layer_names = self.modes["bn_all"] \
+                if FREEZE else self.modes["fc_bn_all"]
+        else:
+            self.layer_names = self.modes["last_conv_only"] \
+                if FREEZE else self.modes["fc_bn_all_last_conv"]
+
+    def _update_dynamic_reverse_schedule(self) -> None:
+        progress = self.steps / N_BATCHES
+        if progress < 1 / 3:
+            self.layer_names = self.modes["fc"]
+        elif progress < 2 / 3:
+            self.layer_names = self.modes["layer4_1"] \
+                if FREEZE else self.modes["fc"] + self.modes["layer4_1"]
+        else:
+            self.layer_names = self.modes["layer4_0"] \
+                if FREEZE else self.modes["fc"] + self.modes["layer4_1"] + self.modes["layer4_0"]
 
     def _active_params(self) -> dict[str, nn.Parameter]:
         """Return a mapping from name → parameter for all active layer names.
@@ -136,6 +216,30 @@ class ZeroOrderOptimizer:
             u = u / norm
         return u
 
+    def _estimate_grad_spsa(
+            self,
+            loss_fn: Callable[[], float],
+            params: dict[str, nn.Parameter],
+    ) -> dict[str, torch.Tensor]:
+        directions: dict[str, torch.Tensor] = {}
+        for name, param in params.items():
+            directions[name] = self._sample_direction(param)
+
+        with torch.no_grad():
+            for name, param in params.items():
+                param.data.add_(self.eps * directions[name])
+            f_plus = loss_fn()
+
+            for name, param in params.items():
+                param.data.sub_(2.0 * self.eps * directions[name])
+            f_minus = loss_fn()
+
+            for name, param in params.items():
+                param.data.add_(self.eps * directions[name])
+
+        scalar_grad = (f_plus - f_minus) / (2.0 * self.eps)
+        return {n: scalar_grad * directions[n] for n in params}
+
     def _estimate_grad(
         self,
         loss_fn: Callable[[], float],
@@ -171,27 +275,12 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the gradient estimation below.
         # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
-
-        with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
-
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
-
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
-
-                # Restore original value
-                param.data.add_(self.eps * u)
-
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
-
-        return grads
+        grads = {n: torch.zeros_like(p) for n, p in params.items()}
+        for _ in range(SPSA_K):
+            single_direction = self._estimate_grad_spsa(loss_fn, params)
+            for n in grads:
+                grads[n].add_(single_direction[n])
+        return {n: g / SPSA_K for n, g in grads.items()}
         # ------------------------------------------------------------------
 
     def _update_params(
@@ -250,6 +339,12 @@ class ZeroOrderOptimizer:
             Each forward pass inside ``loss_fn`` counts toward your compute
             budget, so prefer estimators that minimise the number of calls.
         """
+        if self.mode == "dynamic":
+            self._update_dynamic_schedule()
+        elif self.mode == "dynamic_reverse":
+            self._update_dynamic_reverse_schedule()
+        self.steps += 1
+
         params = self._active_params()
 
         # Record the loss before any perturbation.
@@ -260,3 +355,35 @@ class ZeroOrderOptimizer:
         self._update_params(params, grads)
 
         return float(loss_before)
+
+    def save_mode_param_counts(self) -> None:
+        output_path = f"mode_param_counts.csv"
+        if os.path.exists(output_path):
+            return
+        named = dict(self.model.named_parameters())
+        total_model_params = sum(p.numel() for p in self.model.parameters())
+
+        rows = []
+        for mode_name, layer_names in self.modes.items():
+            n_tensors = len(layer_names)
+            n_params = sum(named[n].numel() for n in layer_names)
+            rows.append({
+                "mode": mode_name,
+                "n_tensors": n_tensors,
+                "n_params": n_params,
+                "percent": round(100.0 * n_params / total_model_params, 2),
+            })
+
+        rows.append({
+            "mode": "full",
+            "n_tensors": len(named),
+            "n_params": total_model_params,
+            "percent": 100.0,
+        })
+
+        rows.sort(key=lambda r: r["n_params"])
+
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["mode", "n_tensors", "n_params", "percent"])
+            writer.writeheader()
+            writer.writerows(rows)
