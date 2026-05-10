@@ -10,6 +10,43 @@ alternatives (e.g. Xavier, orthogonal, small-scale random, learned bias init).
 import torch
 import torch.nn as nn
 
+from config import HEAD_INIT
+from utils import load_prior_init
+
+
+def init_kaiming(layer: nn.Linear) -> None:
+    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+    nn.init.zeros_(layer.bias)
+
+def init_xavier(layer: nn.Linear) -> None:
+    nn.init.xavier_uniform_(layer.weight)
+    nn.init.zeros_(layer.bias)
+
+def init_orthogonal(layer: nn.Linear) -> None:
+    nn.init.orthogonal_(layer.weight)
+    nn.init.zeros_(layer.bias)
+
+def init_small_random(layer: nn.Linear) -> None:
+    nn.init.uniform_(layer.weight, a=-0.01, b=0.01)
+    nn.init.zeros_(layer.bias)
+
+def init_prior(layer: nn.Linear) -> None:
+    num_classes, in_features = layer.weight.shape
+    data = load_prior_init(num_classes, in_features)
+
+    with torch.no_grad():
+        layer.weight.copy_(data["weight"])
+        layer.bias.copy_(data["bias"])
+
+
+HEAD_INIT_STRATEGIES = {
+    "kaiming": init_kaiming,
+    "xavier": init_xavier,
+    "orthogonal": init_orthogonal,
+    "small_random": init_small_random,
+    "prior": init_prior,
+}
+
 
 def init_last_layer(layer: nn.Linear) -> None:
     """Initialize the weights and bias of the final classification layer in-place.
@@ -32,6 +69,5 @@ def init_last_layer(layer: nn.Linear) -> None:
     # -------------------------------------------------------------------------
     # STUDENT: Replace or extend the initialization below.
     # -------------------------------------------------------------------------
-    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
-    nn.init.zeros_(layer.bias)
+    HEAD_INIT_STRATEGIES[HEAD_INIT](layer)
     # -------------------------------------------------------------------------
