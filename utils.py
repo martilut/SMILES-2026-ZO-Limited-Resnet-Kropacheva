@@ -50,7 +50,7 @@ def compute_prior_init(num_classes: int, in_features: int) -> dict[str, torch.Te
 
     class_means = feature_sums / feature_counts.unsqueeze(1)
 
-    weight = class_means
+    weight = class_means / class_means.norm(dim=1, keepdim=True)
     bias = torch.zeros(num_classes)
 
     return {
