@@ -13,4 +13,4 @@ ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
 LR = 1e-3
 EPS = 1e-3
-PERTURBATION_MODE = "rademacher" # "gaussian", "rademacher", "uniform"
+PERTURBATION_MODE = "gaussian" # "gaussian", "rademacher", "uniform"
