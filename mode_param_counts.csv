@@ -1,0 +1,10 @@
+mode,n_tensors,n_params,percent
+fc,2,51300,0.46
+fc_bn_stem,4,51428,0.46
+fc_bn_down,8,53092,0.47
+fc_bn_block,34,58980,0.53
+fc_bn_all,42,60900,0.54
+fc_last_conv,3,2410596,21.47
+fc_bn_all_last_conv,43,2420196,21.56
+fc_bn_all_layer4,47,8449508,75.26
+full,62,11227812,100.0
