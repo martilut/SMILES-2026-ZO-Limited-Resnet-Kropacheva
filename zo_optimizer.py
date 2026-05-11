@@ -32,7 +32,7 @@ import torch.nn as nn
 from config import OPTIMIZATION_MODE, N_BATCHES, SPSA_K, FREEZE, MOVING_AVERAGE_COEFF, UPDATE_RULE, ADAM_BETA1, \
     ADAM_BETA2, ADAM_EPS, LR, EPS, PERTURBATION_MODE
 
-_VERBOSE = True
+_VERBOSE = False
 
 
 class ZeroOrderOptimizer:
@@ -261,7 +261,7 @@ class ZeroOrderOptimizer:
         self,
         loss_fn: Callable[[], float],
         params: dict[str, nn.Parameter],
-    ) -> tuple[dict[str, torch.Tensor], dict]:
+    ) -> dict[str, torch.Tensor]:
         """Estimate a pseudo-gradient for each active parameter.
 
         Skeleton: 2-point central-difference estimator.
@@ -333,6 +333,10 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
+        if self.update_rule == "default":
+            with torch.no_grad():
+                for name, param in params.items():
+                    param.data.sub_(self.lr * grads[name])
         if self.update_rule == "momentum":
             return self._update_momentum(params, grads)
         else:
