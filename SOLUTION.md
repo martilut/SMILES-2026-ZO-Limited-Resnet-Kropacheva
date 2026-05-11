@@ -60,8 +60,8 @@ The final submitted configuration is:
 |---|-------------------------------------------|---|
 | `HEAD_INIT` | `prior`                                   | `config.py` |
 | `OPTIMIZATION_MODE` | `fc_bn_all`                               | `config.py` |
-| `N_BATCHES` | `64`                                      | `config.py`, CLI |
-| `BATCH_SIZE` | `128`                                     | `config.py`, CLI |
+| `N_BATCHES` | `64`                                      | CLI |
+| `BATCH_SIZE` | `128`                                     | CLI |
 | `SPSA_K` | `8`                                       | `config.py` |
 | `MOVING_AVERAGE_COEFF` | `0.5` (momentum β)                        | `config.py` |
 | `UPDATE_RULE` | `momentum`                                | `config.py` |
