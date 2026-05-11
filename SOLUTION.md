@@ -129,12 +129,12 @@ The following results are the best results obtained across different configurati
 I tested five initialization strategies. The `init_last_layer` function in `head_init.py` dispatches based on the `HEAD_INIT` config value.
 
 | Strategy | `imagenet_head` | `init_head` | `finetuned` |
-|---|---|---|---|
-| Kaiming uniform | 0.37% | 1.21% |  1.51% |
-| Xavier uniform | 0.37% | 1.37% | 2.07% |
-| Orthogonal | 0.37% | 1.13% | 0.97% |
-| Small-scale random (±0.01) | 0.37% | 1.36% | 1.87% |
-| CIFAR100 class prior | 0.37% | 53.06% | [TODO]% |
+|---|---|---|-------------|
+| Kaiming uniform | 0.37% | 1.21% | 1.51%       |
+| Xavier uniform | 0.37% | 1.37% | 2.07%       |
+| Orthogonal | 0.37% | 1.13% | 0.97%       |
+| Small-scale random (±0.01) | 0.37% | 1.36% | 1.87%       |
+| CIFAR100 class prior | 0.37% | 53.06% | 53.21%      |
 
 ### 3.2 Update rule
 
