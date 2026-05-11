@@ -29,7 +29,10 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from config import OPTIMIZATION_MODE, N_BATCHES, SPSA_K, FREEZE
+from config import OPTIMIZATION_MODE, N_BATCHES, SPSA_K, FREEZE, MOVING_AVERAGE_COEFF, UPDATE_RULE, ADAM_BETA1, \
+    ADAM_BETA2, ADAM_EPS, LR, EPS, PERTURBATION_MODE
+
+_VERBOSE = True
 
 
 class ZeroOrderOptimizer:
@@ -66,15 +69,15 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
+        lr: float = LR,
+        eps: float = EPS,
+        perturbation_mode: str = PERTURBATION_MODE,
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
 
-        if perturbation_mode not in ("gaussian", "uniform"):
+        if perturbation_mode not in ("gaussian", "uniform", "rademacher"):
             raise ValueError(
                 f"perturbation_mode must be 'gaussian' or 'uniform', "
                 f"got '{perturbation_mode}'"
@@ -99,6 +102,15 @@ class ZeroOrderOptimizer:
             self.layer_names: list[str] = self.modes["fc"]
         else:
             self.layer_names: list[str] = self.modes[self.mode]
+        self.update_rule = UPDATE_RULE
+        self.moving_average: dict[str, torch.Tensor] = {}
+        self.moving_average_coeff = MOVING_AVERAGE_COEFF
+        self.adam_m: dict[str, torch.Tensor] = {}
+        self.adam_v: dict[str, torch.Tensor] = {}
+        self.adam_t: int = 0
+        self.adam_beta1 = ADAM_BETA1
+        self.adam_beta2 = ADAM_BETA2
+        self.adam_eps = ADAM_EPS
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -206,7 +218,12 @@ class ZeroOrderOptimizer:
         Returns:
             A tensor of the same shape as ``param``, normalised to unit L2 norm.
         """
-        if self.perturbation_mode == "gaussian":
+        if self.perturbation_mode == "rademacher":
+            u = torch.randint(
+                0, 2, param.shape, device=param.device, dtype=param.dtype
+            ) * 2 - 1
+            return u
+        elif self.perturbation_mode == "gaussian":
             u = torch.randn_like(param)
         else:  # uniform
             u = torch.rand_like(param) * 2.0 - 1.0
@@ -220,7 +237,7 @@ class ZeroOrderOptimizer:
             self,
             loss_fn: Callable[[], float],
             params: dict[str, nn.Parameter],
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], float, float]:
         directions: dict[str, torch.Tensor] = {}
         for name, param in params.items():
             directions[name] = self._sample_direction(param)
@@ -238,13 +255,13 @@ class ZeroOrderOptimizer:
                 param.data.add_(self.eps * directions[name])
 
         scalar_grad = (f_plus - f_minus) / (2.0 * self.eps)
-        return {n: scalar_grad * directions[n] for n in params}
+        return {n: scalar_grad * directions[n] for n in params}, f_plus, f_minus
 
     def _estimate_grad(
         self,
         loss_fn: Callable[[], float],
         params: dict[str, nn.Parameter],
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         """Estimate a pseudo-gradient for each active parameter.
 
         Skeleton: 2-point central-difference estimator.
@@ -276,18 +293,27 @@ class ZeroOrderOptimizer:
         # STUDENT: Replace or extend the gradient estimation below.
         # ------------------------------------------------------------------
         grads = {n: torch.zeros_like(p) for n, p in params.items()}
+        f_plus_avg = 0.0
+        f_minus_avg = 0.0
         for _ in range(SPSA_K):
-            single_direction = self._estimate_grad_spsa(loss_fn, params)
+            single, fp, fm = self._estimate_grad_spsa(loss_fn, params)
             for n in grads:
-                grads[n].add_(single_direction[n])
-        return {n: g / SPSA_K for n, g in grads.items()}
+                grads[n].add_(single[n])
+            f_plus_avg += fp
+            f_minus_avg += fm
+        diag = {
+            "f_plus_avg": f_plus_avg / SPSA_K,
+            "f_minus_avg": f_minus_avg / SPSA_K,
+            "f_diff_avg": (f_plus_avg - f_minus_avg) / SPSA_K,
+        }
+        return {n: g / SPSA_K for n, g in grads.items()}, diag
         # ------------------------------------------------------------------
 
     def _update_params(
         self,
         params: dict[str, nn.Parameter],
         grads: dict[str, torch.Tensor],
-    ) -> None:
+    ) -> dict:
         """Apply the estimated pseudo-gradients to the active parameters.
 
         Skeleton: vanilla gradient *descent* step (minimising the loss).
@@ -307,10 +333,69 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
+        if self.update_rule == "momentum":
+            return self._update_momentum(params, grads)
+        else:
+            return self._update_adam(params, grads)
+
+    def _update_momentum(
+            self,
+            params: dict[str, nn.Parameter],
+            grads: dict[str, torch.Tensor],
+    ) -> dict:
+        total_grad_norm = sum(g.pow(2).sum() for g in grads.values()).sqrt().item()
+        update_norm_sq = 0.0
+
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+                if name not in self.moving_average:
+                    self.moving_average[name] = torch.zeros_like(param)
+                v = self.moving_average[name]
+                v.mul_(self.moving_average_coeff).add_(grads[name])
+                step = self.lr * v
+                update_norm_sq += step.pow(2).sum().item()
+                param.data.sub_(step)
+
+        return {
+            "grad_norm": total_grad_norm,
+            "update_norm": math.sqrt(update_norm_sq),
+        }
+
+    def _update_adam(
+            self,
+            params: dict[str, nn.Parameter],
+            grads: dict[str, torch.Tensor],
+    ) -> dict:
+        self.adam_t += 1
+        total_grad_norm = sum(g.pow(2).sum() for g in grads.values()).sqrt().item()
+        update_norm_sq = 0.0
+
+        bc1 = 1.0 - self.adam_beta1 ** self.adam_t
+        bc2 = 1.0 - self.adam_beta2 ** self.adam_t
+
+        with torch.no_grad():
+            for name, param in params.items():
+                if name not in self.adam_m:
+                    self.adam_m[name] = torch.zeros_like(param)
+                    self.adam_v[name] = torch.zeros_like(param)
+                m = self.adam_m[name]
+                v = self.adam_v[name]
+                g = grads[name]
+
+                m.mul_(self.adam_beta1).add_(g, alpha=1.0 - self.adam_beta1)
+                v.mul_(self.adam_beta2).addcmul_(g, g, value=1.0 - self.adam_beta2)
+
+                m_hat = m / bc1
+                v_hat = v / bc2
+
+                step = self.lr * m_hat / (v_hat.sqrt() + self.adam_eps)
+                update_norm_sq += step.pow(2).sum().item()
+                param.data.sub_(step)
+
+        return {
+            "grad_norm": total_grad_norm,
+            "update_norm": math.sqrt(update_norm_sq),
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -351,8 +436,19 @@ class ZeroOrderOptimizer:
         with torch.no_grad():
             loss_before = loss_fn()
 
-        grads = self._estimate_grad(loss_fn, params)
-        self._update_params(params, grads)
+        grads, grad_diag = self._estimate_grad(loss_fn, params)
+        upd_diag = self._update_params(params, grads)
+
+        if _VERBOSE:
+            print(
+                f"  [step {self.steps:3d}] "
+                f"loss={loss_before:.4f}  "
+                f"f+={grad_diag['f_plus_avg']:.4f}  "
+                f"f-={grad_diag['f_minus_avg']:.4f}  "
+                f"Δf={grad_diag['f_diff_avg']:+.4e}  "
+                f"||g||={upd_diag['grad_norm']:.4e}  "
+                f"||upd||={upd_diag['update_norm']:.4e}  "
+            )
 
         return float(loss_before)
 
